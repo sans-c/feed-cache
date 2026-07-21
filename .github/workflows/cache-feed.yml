@@ -3,44 +3,93 @@ name: Cache RSS feed
 on:
   workflow_dispatch:
   schedule:
-  - cron: "0 */12 * * *"
+    - cron: "17 */12 * * *"
 
 permissions:
   contents: write
 
+concurrency:
+  group: update-rss-cache
+  cancel-in-progress: false
+
 jobs:
   update-feed:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Download feed
+      - name: Download and validate feed
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p feeds
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+
           curl \
             --fail \
             --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --connect-timeout 15 \
+            --max-time 60 \
+            --max-filesize 5242880 \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
             --silent \
             --show-error \
-            --retry 3 \
-            --output feeds/grewi.xml.new \
-            https://www.grewi.de/feed/
+            --output "$tmp" \
+            'https://www.grewi.de/feed/'
 
-          test -s feeds/grewi.xml.new
-          mv feeds/grewi.xml.new feeds/grewi.xml
+          test -s "$tmp"
+
+          python3 - "$tmp" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+
+          try:
+              root = ET.parse(path).getroot()
+          except ET.ParseError as error:
+              raise SystemExit(f"Downloaded document is not valid XML: {error}")
+
+          local_name = root.tag.rsplit("}", 1)[-1].lower()
+          if local_name not in {"rss", "feed", "rdf"}:
+              raise SystemExit(
+                  f"Unexpected XML root element: {root.tag!r}; "
+                  "expected RSS, Atom, or RDF."
+              )
+          PY
+
+          if [[ -f feeds/grewi.xml ]] &&
+             cmp --silent "$tmp" feeds/grewi.xml; then
+            echo "Feed content has not changed."
+            exit 0
+          fi
+
+          mv "$tmp" feeds/grewi.xml
 
       - name: Commit changed feed
+        shell: bash
         run: |
-          if git diff --quiet -- feeds/grewi.xml; then
-            echo "Feed has not changed."
+          set -euo pipefail
+
+          git add feeds/grewi.xml
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add feeds/grewi.xml
           git commit -m "Update GreWi feed"
           git push
